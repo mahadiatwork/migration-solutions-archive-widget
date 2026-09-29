@@ -32,6 +32,7 @@ import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import { Dialog as MUIDialog } from "@mui/material";
 import { useSnackbar } from "notistack";
 import LinkifyText from "./components/atoms/LinkifyText";
+import { buildArchiveHistorySelectQuery } from "./services/archiveHistoryQuery";
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -186,7 +187,7 @@ const App = () => {
    * @returns {Promise<Array>} - Array of junction records
    */
   const fetchHistoryViaCoqlV8 = async (contactId, limit = 2000, offset = 0) => {
-    const selectQuery = `select Name,id,Contact_History_Info.id,Owner.first_name,Owner.last_name,Contact_Details.Full_Name,Contact_History_Info.History_Type,Contact_History_Info.History_Result,Contact_History_Info.Duration,Contact_History_Info.Regarding,Contact_History_Info.History_Details_Plain,Contact_History_Info.Date,Contact_History_Info.Stakeholder from History_X_Contacts where Contact_Details = '${contactId}' LIMIT ${offset}, ${limit}`;
+    const selectQuery = buildArchiveHistorySelectQuery(contactId, limit, offset);
 
     const req_data = {
       url: `${dataCenterMap.AU}/crm/v8/coql`,
