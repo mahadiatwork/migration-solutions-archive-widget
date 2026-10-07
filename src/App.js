@@ -99,6 +99,71 @@ const clearHistoryCache = () => {
   globalHistoryCache.clear();
 };
 
+const ARCHIVE_COQL_PAGE_SIZE = 2000;
+const ARCHIVE_COQL_MAX_RECORDS = 100000;
+
+/**
+ * Normalize the response shapes returned by ZOHO.CRM.CONNECTION.invoke for
+ * COQL v8 requests. The CRM wrapper may put the payload at the top level,
+ * under details, or inside a JSON-encoded statusMessage.
+ */
+const parseCoqlV8Response = (response) => {
+  const rawStatusMessage = response?.details?.statusMessage;
+  let parsedStatusMessage = rawStatusMessage;
+
+  if (typeof rawStatusMessage === "string" && rawStatusMessage.trim()) {
+    try {
+      parsedStatusMessage = JSON.parse(rawStatusMessage);
+    } catch {
+      parsedStatusMessage = null;
+    }
+  }
+
+  const candidates = [parsedStatusMessage, response?.details, response].filter(
+    (candidate) => candidate && typeof candidate === "object"
+  );
+
+  let data = [];
+  let moreRecords = false;
+  let errorCode = null;
+  let errorMessage = null;
+
+  for (const candidate of candidates) {
+    if (!data.length && Array.isArray(candidate.data)) {
+      data = candidate.data;
+    }
+
+    if (
+      candidate.info &&
+      typeof candidate.info === "object" &&
+      candidate.info.more_records != null
+    ) {
+      moreRecords =
+        candidate.info.more_records === true ||
+        candidate.info.more_records === "true";
+    }
+
+    if (
+      candidate.status === "error" ||
+      candidate.code === "INVALID_QUERY" ||
+      candidate.code === "LIMIT_EXCEEDED"
+    ) {
+      errorCode = candidate.code || "ERROR";
+      errorMessage = candidate.message || null;
+    }
+  }
+
+  return { data, moreRecords, errorCode, errorMessage, raw: response };
+};
+
+const requireSuccessfulCoqlPage = (page, label) => {
+  if (page?.errorCode) {
+    throw new Error(
+      `COQL ${label} failed: ${page.errorCode}${page.errorMessage ? ` - ${page.errorMessage}` : ""}`
+    );
+  }
+};
+
 // ============================================================================
 // STEP 2: Component State Management
 // ============================================================================
@@ -176,18 +241,19 @@ const App = () => {
   };
 
   // ============================================================================
-  // COQL v8 Fetch Helper (up to 2000 records in one call)
+  // COQL v8 Fetch Helpers (2000 records per page, paginated for full archive)
   // ============================================================================
-  /**
-   * Fetch History_X_Contacts via COQL v8 API (up to 2000 records in one call)
-   * Uses CONNECTION.invoke POST to {dataCenter}/crm/v8/coql
-   * @param {string} contactId - Contact record ID (from widget context)
-   * @param {number} [limit=2000] - Max records (v8 allows up to 2000)
-   * @param {number} [offset=0] - Pagination offset
-   * @returns {Promise<Array>} - Array of junction records
-   */
-  const fetchHistoryViaCoqlV8 = async (contactId, limit = 2000, offset = 0) => {
-    const selectQuery = buildArchiveHistorySelectQuery(contactId, limit, offset);
+  const fetchHistoryViaCoqlV8 = async (
+    contactId,
+    limit = ARCHIVE_COQL_PAGE_SIZE,
+    cursor = null
+  ) => {
+    const selectQuery = buildArchiveHistorySelectQuery(
+      contactId,
+      limit,
+      0,
+      cursor
+    );
 
     const req_data = {
       url: `${dataCenterMap.AU}/crm/v8/coql`,
@@ -198,22 +264,109 @@ const App = () => {
 
     const response = await ZOHO.CRM.CONNECTION.invoke(conn_name, req_data);
 
-    // Handle response format (may vary: data vs details.statusMessage.data)
-    let data = [];
-    if (response?.data) {
-      data = Array.isArray(response.data) ? response.data : [];
-    } else if (response?.details?.statusMessage?.data) {
-      data = Array.isArray(response.details.statusMessage.data)
-        ? response.details.statusMessage.data
-        : [];
-    }
-
-    return data;
+    return parseCoqlV8Response(response);
   };
 
   // ============================================================================
-  // STEP 4: Default Data Fetching (COQL v8 – up to 2000 records per plan)
+  // STEP 4: Default Data Fetching (COQL v8 – paginated full archive)
   // ============================================================================
+  const fetchHistoryViaCoqlV8Offset = async (
+    contactId,
+    limit = ARCHIVE_COQL_PAGE_SIZE,
+    offset = 0
+  ) => {
+    const selectQuery = buildArchiveHistorySelectQuery(
+      contactId,
+      limit,
+      offset
+    );
+
+    const req_data = {
+      url: `${dataCenterMap.AU}/crm/v8/coql`,
+      method: "POST",
+      param_type: 2,
+      parameters: { select_query: selectQuery },
+    };
+
+    const response = await ZOHO.CRM.CONNECTION.invoke(conn_name, req_data);
+    return parseCoqlV8Response(response);
+  };
+
+  const fetchAllHistoryViaCoqlV8 = async (
+    contactId,
+    pageSize = ARCHIVE_COQL_PAGE_SIZE
+  ) => {
+    const allRecords = [];
+    const seenIds = new Set();
+    let cursor = null;
+    let offset = 0;
+    let pageIndex = 0;
+    let useKeyset = true;
+
+    while (allRecords.length < ARCHIVE_COQL_MAX_RECORDS) {
+      let page = useKeyset
+        ? await fetchHistoryViaCoqlV8(contactId, pageSize, cursor)
+        : await fetchHistoryViaCoqlV8Offset(contactId, pageSize, offset);
+
+      // A keyset query is preferred because it remains stable while the CRM
+      // data changes. Fall back to LIMIT offset if the org rejects the cursor
+      // query or a later cursor page fails.
+      if (page.errorCode && page.data.length === 0 && useKeyset) {
+        console.warn(
+          `Archive keyset page ${pageIndex} failed; falling back to offset pagination`,
+          page.errorMessage || page.errorCode
+        );
+        useKeyset = false;
+        offset = allRecords.length;
+        page = await fetchHistoryViaCoqlV8Offset(contactId, pageSize, offset);
+      }
+
+      requireSuccessfulCoqlPage(page, `archive page ${pageIndex}`);
+
+      let addedThisPage = 0;
+      page.data.forEach((row, rowIndex) => {
+        const key = row?.id ? String(row.id) : `row-${allRecords.length}-${rowIndex}`;
+        if (!seenIds.has(key)) {
+          seenIds.add(key);
+          allRecords.push(row);
+          addedThisPage += 1;
+        }
+      });
+
+      if (page.data.length === 0) break;
+      if (page.data.length < pageSize && !page.moreRecords) break;
+      if (addedThisPage === 0) {
+        console.warn(`Archive page ${pageIndex} returned no new records; stopping`);
+        break;
+      }
+
+      const lastRow = page.data[page.data.length - 1];
+      const nextCursor = {
+        date: lastRow?.["Contact_History_Info.Date"] || lastRow?.Date || null,
+        id: lastRow?.id || null,
+      };
+
+      if (useKeyset && nextCursor.date && nextCursor.id) {
+        cursor = nextCursor;
+      } else {
+        useKeyset = false;
+        // The cache contains every row fetched so far, so the next offset
+        // starts immediately after the current page.
+        offset = allRecords.length;
+      }
+
+      pageIndex += 1;
+    }
+
+    if (allRecords.length >= ARCHIVE_COQL_MAX_RECORDS) {
+      console.warn(
+        `Archive history reached the ${ARCHIVE_COQL_MAX_RECORDS}-record safety limit`
+      );
+    }
+
+    return allRecords;
+  };
+
   const fetchRLData = async (options = {}) => {
     if (!module || !recordId) return;
     // Migration Solutions History = Contact History; COQL v8 fetches History_X_Contacts for Contact only
@@ -225,10 +378,13 @@ const App = () => {
     try {
       let dataArray = [];
       try {
-        dataArray = await fetchHistoryViaCoqlV8(recordId, 2000, 0);
+        dataArray = await fetchAllHistoryViaCoqlV8(recordId);
       } catch (coqlError) {
-        console.warn("COQL v8 (2000) failed, falling back to 200:", coqlError);
-        dataArray = await fetchHistoryViaCoqlV8(recordId, 200, 0);
+        console.warn(
+          "COQL v8 archive pagination failed, retrying with 200-record pages:",
+          coqlError
+        );
+        dataArray = await fetchAllHistoryViaCoqlV8(recordId, 200);
       }
       dataArray = Array.isArray(dataArray) ? dataArray : [];
 

@@ -24,4 +24,19 @@ describe("buildArchiveHistorySelectQuery", () => {
     );
     expect(query).toMatch(/LIMIT 0, 200$/);
   });
+
+  test("uses a stable cursor for subsequent archive pages", () => {
+    const query = buildArchiveHistorySelectQuery("CONTACT_ID", 2000, 0, {
+      date: "2022-12-30T13:08:00+10:30",
+      id: "HISTORY_ID",
+    });
+
+    expect(query).toContain(
+      "((Contact_History_Info.Date < '2022-12-30T13:08:00+10:30') or (Contact_History_Info.Date = '2022-12-30T13:08:00+10:30' and id < 'HISTORY_ID'))"
+    );
+    expect(query).toContain(
+      "order by Contact_History_Info.Date desc, id desc"
+    );
+    expect(query).toMatch(/LIMIT 0, 2000$/);
+  });
 });
